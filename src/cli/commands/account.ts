@@ -8,10 +8,14 @@ import { network } from "../../abis/config.ts";
 import {
 	createSubaccount,
 	depositToSubaccount,
+	getFreeDeposit,
+	getMarkets,
 	getPublicClient,
 	getSubaccountBalance,
 	getSubaccounts,
 	getTokenBalance,
+	getUserActiveOrders,
+	getUserPerpPositions,
 	setDelegate,
 	withdrawFromSubaccount,
 } from "../../services/client.ts";
@@ -21,8 +25,10 @@ import {
 	unlockWallet,
 	walletExists,
 } from "../../services/wallet.ts";
+import { USDC_DECIMALS } from "../../utils/constants.ts";
 import {
 	dim,
+	formatUSD,
 	info as infoMsg,
 	parseAmountOrPercent,
 	truncateAddress,
@@ -158,55 +164,106 @@ export async function info(args: ParsedArgs): Promise<void> {
 
 	consola.start("Fetching account info...");
 
-	// Simulated account info
-	if (args.flags.json) {
+	try {
+		const subaccounts = await getSubaccounts(address);
+		const subaccount = subaccounts.find((s) => s.name === accountName);
+
+		if (!subaccount) {
+			throw new Error(`Subaccount "${accountName}" not found.`);
+		}
+
+		// Get markets for referencing
+		const { perp } = getMarkets();
+		const marketIds = perp.map((m) => Number.parseInt(m.pairId, 10));
+
+		// Fetch data in parallel
+		const [freeMargin, positions, activeOrders] = await Promise.all([
+			getFreeDeposit(subaccount.address),
+			getUserPerpPositions(subaccount.address, marketIds),
+			getUserActiveOrders(subaccount.address),
+		]);
+
+		// Calculate Margin Used
+		// Margin Used = Sum(|Size| * EntryPrice / Leverage)
+		let marginUsed = 0n;
+		for (const p of positions) {
+			const size = p.base_asset_amount > 0n ? p.base_asset_amount : -p.base_asset_amount;
+			const leverage = BigInt(Math.floor(Number(p.leverage)));
+			// Assuming EntryPrice (18 decimals) * Size (18 decimals) / Leverage
+			// We want result in USDC_DECIMALS (6)
+			// Divisor = Leverage * 10^(18 + 18 - 6) = Leverage * 10^30
+
+			// Note: We need to verify base token decimals. Assuming 18 for now as standard.
+			// Ideally we lookup the market base token decimals.
+			const market = perp.find(m => Number.parseInt(m.pairId, 10) === p.market_id);
+			const baseDecimals = market?.tokens?.[0]?.decimals || 18;
+
+			const divisorPower = baseDecimals + 18 - USDC_DECIMALS;
+			const divisor = leverage * (10n ** BigInt(divisorPower));
+
+			if (divisor > 0n) {
+				marginUsed += (size * p.entry_price) / divisor;
+			}
+		}
+
+		const balance = freeMargin + marginUsed;
+
+		if (args.flags.json) {
+			console.log(
+				JSON.stringify(
+					{
+						name: subaccount.name,
+						owner: address,
+						address: subaccount.address,
+						balance: balance.toString(),
+						marginUsed: marginUsed.toString(),
+						freeMargin: freeMargin.toString(),
+						openPositions: positions.length,
+						openOrders: activeOrders.length,
+					},
+					null,
+					2,
+				),
+			);
+			return;
+		}
+
+		console.log();
+		consola.box({
+			title: `📊 Subaccount: ${subaccount.name}`,
+			message: `Owner: ${truncateAddress(address)}
+Address: ${truncateAddress(subaccount.address)}`,
+			style: {
+				padding: 1,
+				borderColor: "cyan",
+				borderStyle: "rounded",
+			},
+		});
+
+		console.log();
+
 		console.log(
-			JSON.stringify(
+			keyValue(
 				{
-					name: accountName,
-					owner: address,
-					balance: "0",
-					marginUsed: "0",
-					freeMargin: "0",
+					Balance: formatUSD(balance),
+					"Margin Used": formatUSD(marginUsed),
+					"Free Margin": formatUSD(freeMargin),
+					"Open Positions": positions.length.toString(),
+					"Open Orders": activeOrders.length.toString(),
 				},
-				null,
 				2,
 			),
 		);
-		return;
+
+		console.log();
+		console.log(
+			infoMsg("Deposit funds with: deepdex account deposit <amount> USDC"),
+		);
+		console.log();
+
+	} catch (error) {
+		consola.error(`Failed to fetch account info: ${(error as Error).message}`);
 	}
-
-	console.log();
-	consola.box({
-		title: `📊 Subaccount: ${accountName}`,
-		message: `Owner: ${truncateAddress(address)}`,
-		style: {
-			padding: 1,
-			borderColor: "cyan",
-			borderStyle: "rounded",
-		},
-	});
-
-	console.log();
-
-	console.log(
-		keyValue(
-			{
-				Balance: "$0.00",
-				"Margin Used": "$0.00",
-				"Free Margin": "$0.00",
-				"Open Positions": "0",
-				"Open Orders": "0",
-			},
-			2,
-		),
-	);
-
-	console.log();
-	console.log(
-		infoMsg("Deposit funds with: deepdex account deposit <amount> USDC"),
-	);
-	console.log();
 }
 
 /**
